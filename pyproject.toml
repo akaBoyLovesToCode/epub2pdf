@@ -1,0 +1,17 @@
+[project]
+name = "epub2pdf"
+version = "1.0.0"
+description = "Convert fixed-layout EPUBs into large-screen-friendly PDFs."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "img2pdf>=0.6.1",
+    "pillow>=12.0.0",
+]
+authors = [
+    { name = "epub2pdf Authors" },
+]
+license = { text = "MIT" }
+
+[project.scripts]
+epub2pdf = "epub2pdf:main"
