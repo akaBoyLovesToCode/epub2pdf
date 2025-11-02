@@ -1,5 +1,6 @@
 import argparse
 import io
+import logging
 import os
 import posixpath
 import shutil
@@ -16,6 +17,11 @@ import img2pdf
 from PIL import Image
 
 Margins = tuple[int, int, int, int]
+DEFAULT_BASE_FONT_SIZE = 14
+DEFAULT_MARGIN_POINTS = 4
+MAX_INSPECTION_PAGES = 5
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -255,11 +261,11 @@ def analyze_epub(epub_path: Path) -> EpubAnalysis:
 
 
 def print_epub_inspection(
-    epub_path: Path, analysis: EpubAnalysis, limit: int = 5
+    epub_path: Path, analysis: EpubAnalysis, limit: int = MAX_INSPECTION_PAGES
 ) -> None:
-    print(f"[inspect] {epub_path}")
+    logger.info("Inspecting %s", epub_path)
     if not analysis.image_pages:
-        print("  [info] No single-image pages detected.")
+        logger.info("No single-image pages detected.")
         return
 
     sample = analysis.image_pages[:limit]
@@ -267,14 +273,26 @@ def print_epub_inspection(
         for page in sample:
             width = height = None
             try:
-                with zf.open(page.image_path) as image_stream, Image.open(image_stream) as image:
+                with (
+                    zf.open(page.image_path) as image_stream,
+                    Image.open(image_stream) as image,
+                ):
                     width, height = image.size
             except Exception as exc:
-                print(f"  {page.html_path} -> {page.image_path} [error: {exc}]")
+                logger.error(
+                    "Failed to inspect %s -> %s: %s",
+                    page.html_path,
+                    page.image_path,
+                    exc,
+                )
                 continue
-            print(
-                f"  {page.html_path} -> {page.image_path} "
-                f"({width}x{height}) viewport={page.has_viewport}"
+            logger.info(
+                "%s -> %s (%sx%s) viewport=%s",
+                page.html_path,
+                page.image_path,
+                width,
+                height,
+                page.has_viewport,
             )
 
 
@@ -288,9 +306,9 @@ def convert_images_to_pdf(
 ) -> bool:
     if out_path.exists():
         if not overwrite:
-            print(f"[skip] {out_path} already exists")
+            logger.info("Skipping existing file %s", out_path)
             return False
-        print(f"[warn] Overwriting existing file: {out_path}")
+        logger.warning("Overwriting existing file: %s", out_path)
 
     if not image_pages:
         raise ValueError("No image pages available for image-only conversion")
@@ -311,14 +329,20 @@ def convert_images_to_pdf(
             buffers.append(buffer)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    print(
-        f"[run] image-only {len(buffers)} pages -> {out_path} "
-        f"(page={page_size[0]:.1f}x{page_size[1]:.1f}pt, border={border})"
+    logger.info(
+        "Running image-only conversion: %s pages -> %s (page=%.1fx%.1fpt, border=%s)",
+        len(buffers),
+        out_path,
+        page_size[0],
+        page_size[1],
+        border,
     )
     pdf_bytes = img2pdf.convert(buffers, layout_fun=layout_fun, border=border)
     with open(out_path, "wb") as pdf_file:
         pdf_file.write(pdf_bytes)
-    print(f"[ok] {epub_path.name} -> {out_path.name} (image-only)")
+    logger.info(
+        "Image-only conversion complete: %s -> %s", epub_path.name, out_path.name
+    )
     return True
 
 
@@ -398,9 +422,9 @@ def run_calibre_command(cmd: list[str], allow_no_text: bool) -> None:
         errors="ignore",
     )
     if result.stdout:
-        print(result.stdout, end="")
+        logger.info("%s", result.stdout.rstrip())
     if result.stderr:
-        print(result.stderr, end="", file=sys.stderr)
+        logger.warning("%s", result.stderr.rstrip())
     if result.returncode == 0:
         return
 
@@ -410,15 +434,15 @@ def run_calibre_command(cmd: list[str], allow_no_text: bool) -> None:
         and "--no-text" in cmd
         and "no such option: --no-text" in stderr_text
     ):
-        print(
-            "[warn] --no-text not supported by this Calibre version; retrying without it."
+        logger.warning(
+            "--no-text not supported by this Calibre version; retrying without it."
         )
         filtered_cmd = [part for part in cmd if part != "--no-text"]
-        print(f"[run] {format_command(filtered_cmd)}")
+        logger.info("Retrying command: %s", format_command(filtered_cmd))
         run_calibre_command(filtered_cmd, False)
         return
     if "--filter-css" in cmd and "no such option: --filter-css" in stderr_text:
-        print("[warn] --filter-css unsupported; retrying without it.")
+        logger.warning("--filter-css unsupported; retrying without it.")
         filtered_cmd = []
         skip_next = False
         for part in cmd:
@@ -429,7 +453,7 @@ def run_calibre_command(cmd: list[str], allow_no_text: bool) -> None:
                 skip_next = True
                 continue
             filtered_cmd.append(part)
-        print(f"[run] {format_command(filtered_cmd)}")
+        logger.info("Retrying command: %s", format_command(filtered_cmd))
         run_calibre_command(filtered_cmd, allow_no_text)
         return
 
@@ -453,9 +477,9 @@ def convert_epub_to_pdf(
 ) -> bool:
     if out_path.exists():
         if not overwrite:
-            print(f"[skip] {out_path} already exists")
+            logger.info("Skipping existing file %s", out_path)
             return False
-        print(f"[warn] Overwriting existing file: {out_path}")
+        logger.warning("Overwriting existing file: %s", out_path)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     cmd = build_command(
@@ -472,9 +496,9 @@ def convert_epub_to_pdf(
         no_text=no_text,
         force_full_image=force_full_image,
     )
-    print(f"[run] {format_command(cmd)}")
+    logger.info("Running Calibre command: %s", format_command(cmd))
     run_calibre_command(cmd, allow_no_text=no_text)
-    print(f"[ok] {epub_path.name} -> {out_path.name}")
+    logger.info("Calibre conversion complete: %s -> %s", epub_path.name, out_path.name)
     return True
 
 
@@ -494,7 +518,7 @@ def batch_convert(
     inspect_epub: bool,
 ) -> tuple[int, int, int]:
     if not jobs:
-        print("[info] No EPUB files found for conversion.")
+        logger.info("No EPUB files found for conversion.")
         return (0, 0, 0)
 
     converted = 0
@@ -512,7 +536,7 @@ def batch_convert(
             try:
                 analysis = analyze_epub(epub_path)
             except Exception as exc:
-                print(f"[warn] Failed to inspect {epub_path.name}: {exc}")
+                logger.warning("Failed to inspect %s: %s", epub_path.name, exc)
 
         if analysis and inspect_epub:
             print_epub_inspection(epub_path, analysis)
@@ -522,20 +546,20 @@ def batch_convert(
                 if analysis.is_image_book and analysis.image_pages:
                     use_image_pipeline = True
                 else:
-                    print(
-                        f"[warn] {epub_path.name} does not appear to be single-image; "
-                        "falling back to Calibre pipeline."
+                    logger.warning(
+                        "%s does not appear to be single-image; falling back to Calibre pipeline.",
+                        epub_path.name,
                     )
             elif force_full_image and analysis.is_image_book and analysis.image_pages:
-                print(
-                    "[info] Switching to image-only pipeline for "
-                    f"{epub_path.name} (fixed-layout detected)."
+                logger.info(
+                    "Switching to image-only pipeline for %s (fixed-layout detected).",
+                    epub_path.name,
                 )
                 use_image_pipeline = True
         elif image_only:
-            print(
-                f"[warn] Unable to analyze {epub_path.name}; falling back to "
-                "Calibre pipeline."
+            logger.warning(
+                "Unable to analyze %s; falling back to Calibre pipeline.",
+                epub_path.name,
             )
 
         if use_image_pipeline and analysis:
@@ -553,14 +577,14 @@ def batch_convert(
                     skipped += 1
             except Exception as exc:
                 failed += 1
-                print(f"[error] Image-only conversion failed for {epub_path}: {exc}")
+                logger.error("Image-only conversion failed for %s: %s", epub_path, exc)
             continue
 
         if converter is None:
             try:
                 converter = find_ebook_convert()
             except RuntimeError as exc:
-                print(f"[error] {exc}")
+                logger.error("%s", exc)
                 failed += 1
                 continue
 
@@ -585,7 +609,7 @@ def batch_convert(
                 skipped += 1
         except subprocess.CalledProcessError as error:
             failed += 1
-            print(f"[error] Conversion failed for {epub_path}: {error}")
+            logger.error("Conversion failed for %s: %s", epub_path, error)
     return converted, skipped, failed
 
 
@@ -660,8 +684,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--base-font-size",
         type=int,
-        default=14,
-        help="Base font size in points.",
+        default=DEFAULT_BASE_FONT_SIZE,
+        help=f"Base font size in points (default: {DEFAULT_BASE_FONT_SIZE}).",
     )
     parser.add_argument(
         "--paper-size",
@@ -699,26 +723,26 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--margin-top",
         type=int,
-        default=4,
-        help="Top page margin in points (default: 4).",
+        default=DEFAULT_MARGIN_POINTS,
+        help=f"Top page margin in points (default: {DEFAULT_MARGIN_POINTS}).",
     )
     parser.add_argument(
         "--margin-bottom",
         type=int,
-        default=4,
-        help="Bottom page margin in points (default: 4).",
+        default=DEFAULT_MARGIN_POINTS,
+        help=f"Bottom page margin in points (default: {DEFAULT_MARGIN_POINTS}).",
     )
     parser.add_argument(
         "--margin-left",
         type=int,
-        default=4,
-        help="Left page margin in points (default: 4).",
+        default=DEFAULT_MARGIN_POINTS,
+        help=f"Left page margin in points (default: {DEFAULT_MARGIN_POINTS}).",
     )
     parser.add_argument(
         "--margin-right",
         type=int,
-        default=4,
-        help="Right page margin in points (default: 4).",
+        default=DEFAULT_MARGIN_POINTS,
+        help=f"Right page margin in points (default: {DEFAULT_MARGIN_POINTS}).",
     )
     parser.add_argument(
         "--no-text",
@@ -749,6 +773,8 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    if not logging.getLogger().hasHandlers():
+        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv or sys.argv[1:])
 
     src_path = args.src.resolve(strict=False)
@@ -792,13 +818,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             inspect_epub=args.inspect_epub,
         )
     except (ValueError, RuntimeError) as error:
-        print(f"[error] {error}", file=sys.stderr)
+        logger.error("%s", error)
         return 1
 
     source_label = src_path if src_path.is_dir() else src_path.name
-    print(
-        f"[summary] converted={converted} skipped={skipped} failed={failed} "
-        f"from {source_label}"
+    logger.info(
+        "Summary: converted=%s skipped=%s failed=%s from %s",
+        converted,
+        skipped,
+        failed,
+        source_label,
     )
     return 0
 
