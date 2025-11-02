@@ -9,6 +9,7 @@ import sys
 import xml.etree.ElementTree as ET
 import zipfile
 from collections.abc import Iterable, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
@@ -22,6 +23,24 @@ DEFAULT_MARGIN_POINTS = 4
 MAX_INSPECTION_PAGES = 5
 
 logger = logging.getLogger(__name__)
+
+
+def extract_namespace(tag: str) -> dict[str, str]:
+    """Return namespace mapping for an XML tag such as '{uri}package'."""
+    if tag.startswith("{"):
+        uri = tag[1:].split("}", 1)[0]
+        return {"opf": uri}
+    return {}
+
+
+@contextmanager
+def open_epub_file(zf: zipfile.ZipFile, path: str):
+    """Yield a file-like object from the EPUB archive with consistent errors."""
+    try:
+        with zf.open(path) as stream:
+            yield stream
+    except KeyError as exc:
+        raise ValueError(f"File not found in EPUB: {path}") from exc
 
 
 @dataclass
@@ -156,9 +175,9 @@ def resolve_zip_href(base_path: str, href: str) -> str:
 
 def get_spine_document_paths(zf: zipfile.ZipFile) -> list[str]:
     try:
-        with zf.open("META-INF/container.xml") as container_file:
+        with open_epub_file(zf, "META-INF/container.xml") as container_file:
             container_xml = container_file.read()
-    except KeyError as exc:
+    except ValueError as exc:
         raise ValueError("META-INF/container.xml not found in EPUB") from exc
 
     container_root = ET.fromstring(container_xml)
@@ -171,27 +190,25 @@ def get_spine_document_paths(zf: zipfile.ZipFile) -> list[str]:
         raise ValueError("EPUB container missing rootfile path")
 
     try:
-        with zf.open(opf_path) as opf_file:
+        with open_epub_file(zf, opf_path) as opf_file:
             opf_xml = opf_file.read()
-    except KeyError as exc:
+    except ValueError as exc:
         raise ValueError(f"Unable to open OPF package at {opf_path}") from exc
 
     package_root = ET.fromstring(opf_xml)
-    if package_root.tag[0] == "{":
-        namespace_uri = package_root.tag[1:].split("}", 1)[0]
-        ns = {"opf": namespace_uri}
-    else:
-        ns = {"opf": ""}
+    ns = extract_namespace(package_root.tag)
 
     manifest: dict[str, str] = {}
-    for item in package_root.findall("opf:manifest/opf:item", ns):
+    manifest_path = "opf:manifest/opf:item" if ns else "manifest/item"
+    for item in package_root.findall(manifest_path, ns):
         item_id = item.attrib.get("id")
         href = item.attrib.get("href")
         if item_id and href:
             manifest[item_id] = href
 
     spine_documents: list[str] = []
-    for itemref in package_root.findall("opf:spine/opf:itemref", ns):
+    spine_path = "opf:spine/opf:itemref" if ns else "spine/itemref"
+    for itemref in package_root.findall(spine_path, ns):
         idref = itemref.attrib.get("idref")
         if not idref:
             continue
@@ -221,8 +238,9 @@ def analyze_epub(epub_path: Path) -> EpubAnalysis:
 
         for doc_path in spine_documents:
             try:
-                raw = zf.read(doc_path)
-            except KeyError:
+                with open_epub_file(zf, doc_path) as doc_file:
+                    raw = doc_file.read()
+            except ValueError:
                 continue
             parser = SingleImageHTMLParser()
             try:
@@ -274,7 +292,7 @@ def print_epub_inspection(
             width = height = None
             try:
                 with (
-                    zf.open(page.image_path) as image_stream,
+                    open_epub_file(zf, page.image_path) as image_stream,
                     Image.open(image_stream) as image,
                 ):
                     width, height = image.size
@@ -321,8 +339,9 @@ def convert_images_to_pdf(
     with zipfile.ZipFile(epub_path, "r") as zf:
         for index, page in enumerate(image_pages):
             try:
-                data = zf.read(page.image_path)
-            except KeyError as exc:
+                with open_epub_file(zf, page.image_path) as image_stream:
+                    data = image_stream.read()
+            except ValueError as exc:
                 raise ValueError(f"Missing image asset: {page.image_path}") from exc
             buffer = io.BytesIO(data)
             buffer.name = posixpath.basename(page.image_path) or f"page-{index:03}.jpg"
