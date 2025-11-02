@@ -25,6 +25,12 @@ DEFAULT_BASE_FONT_SIZE = 14
 DEFAULT_MARGIN_POINTS = 4
 # Number of sample pages displayed when inspecting image-centric EPUBs.
 MAX_INSPECTION_PAGES = 5
+# Long edge (mm) used to auto-size pages in the image-only pipeline (approx B4 height).
+IMAGE_LONG_EDGE_MM = 353.0
+# Minimum short edge (mm) to ensure page width remains generous for images.
+IMAGE_MIN_SHORT_EDGE_MM = 250.0
+# Conversion factor from PostScript points to millimetres.
+POINT_TO_MM = 25.4 / 72
 
 logger = logging.getLogger(__name__)
 
@@ -275,6 +281,37 @@ def resolve_page_size(paper_size: str, custom_size: str | None) -> tuple[float, 
     return (img2pdf.mm_to_pt(mm_values[0]), img2pdf.mm_to_pt(mm_values[1]))
 
 
+def derive_page_size_from_image(
+    image_size: tuple[int, int],
+) -> tuple[float, float] | None:
+    """Infer a page size (points) from an image's aspect ratio.
+
+    Uses ``IMAGE_LONG_EDGE_MM`` as the long edge and clamps the short edge to
+    ``IMAGE_MIN_SHORT_EDGE_MM`` to keep pages generous for tall artwork.
+
+    Args:
+        image_size: A tuple of ``(width_px, height_px)`` from the source image.
+
+    Returns:
+        Tuple of ``(width_pt, height_pt)`` suitable for img2pdf or ``None`` when
+        the provided dimensions are invalid.
+    """
+    width_px, height_px = image_size
+    if width_px <= 0 or height_px <= 0:
+        return None
+
+    long_mm = IMAGE_LONG_EDGE_MM
+    if width_px >= height_px:
+        short_mm = max(IMAGE_MIN_SHORT_EDGE_MM, long_mm * (height_px / width_px))
+        width_pt = img2pdf.mm_to_pt(long_mm)
+        height_pt = img2pdf.mm_to_pt(short_mm)
+    else:
+        short_mm = max(IMAGE_MIN_SHORT_EDGE_MM, long_mm * (width_px / height_px))
+        width_pt = img2pdf.mm_to_pt(short_mm)
+        height_pt = img2pdf.mm_to_pt(long_mm)
+    return (width_pt, height_pt)
+
+
 def resolve_zip_href(base_path: str, href: str) -> str:
     """Resolve a relative asset reference within the EPUB zip.
 
@@ -464,7 +501,7 @@ def convert_images_to_pdf(
     epub_path: Path,
     out_path: Path,
     image_pages: list[ImagePage],
-    page_size: tuple[float, float],
+    page_size: tuple[float, float] | None,
     margins: Margins,
     overwrite: bool,
 ) -> bool:
@@ -474,7 +511,7 @@ def convert_images_to_pdf(
         epub_path: Source EPUB archive.
         out_path: Destination PDF file.
         image_pages: Pages identified as image-only content.
-        page_size: Output page size in points.
+        page_size: Output page size in points, or ``None`` to auto-derive.
         margins: Margins tuple used for img2pdf borders.
         overwrite: Whether to replace an existing file.
 
@@ -495,9 +532,9 @@ def convert_images_to_pdf(
 
     top, bottom, left, right = margins
     border = (float(top), float(right), float(bottom), float(left))
-    layout_fun = img2pdf.get_layout_fun(page_size)
 
     buffers: list[io.BytesIO] = []
+    first_image_size: tuple[int, int] | None = None
     with zipfile.ZipFile(epub_path, "r") as zf:
         for index, page in enumerate(image_pages):
             try:
@@ -509,6 +546,8 @@ def convert_images_to_pdf(
             try:
                 with Image.open(verify_stream) as image:
                     image.verify()
+                    if first_image_size is None:
+                        first_image_size = image.size
             except (UnidentifiedImageError, OSError) as exc:
                 logger.warning("Skipping invalid image %s: %s", page.image_path, exc)
                 continue
@@ -519,15 +558,31 @@ def convert_images_to_pdf(
     if not buffers:
         raise ValueError("No valid images available for image-only conversion")
 
+    target_page_size = page_size
+    if target_page_size is None:
+        derived_size = derive_page_size_from_image(first_image_size or (0, 0))
+        if derived_size is None:
+            raise ValueError("Unable to determine page size for image-only conversion")
+        target_page_size = derived_size
+        width_mm = target_page_size[0] * POINT_TO_MM
+        height_mm = target_page_size[1] * POINT_TO_MM
+        logger.info(
+            "Auto-selected page size %.1fmm x %.1fmm for %s",
+            width_mm,
+            height_mm,
+            epub_path.name,
+        )
+
     out_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
         "Running image-only conversion: %s pages -> %s (page=%.1fx%.1fpt, border=%s)",
         len(buffers),
         out_path,
-        page_size[0],
-        page_size[1],
+        target_page_size[0],
+        target_page_size[1],
         border,
     )
+    layout_fun = img2pdf.get_layout_fun(target_page_size)
     pdf_bytes = img2pdf.convert(buffers, layout_fun=layout_fun, border=border)
     with open(out_path, "wb") as pdf_file:
         pdf_file.write(pdf_bytes)
@@ -847,11 +902,14 @@ def batch_convert(
 
             if use_image_pipeline and analysis:
                 try:
+                    image_page_size: tuple[float, float] | None = page_size
+                    if custom_size is None and paper_size.lower() == "a4":
+                        image_page_size = None
                     if convert_images_to_pdf(
                         epub_path=epub_path,
                         out_path=out_path,
                         image_pages=analysis.image_pages,
-                        page_size=page_size,
+                        page_size=image_page_size,
                         margins=margins,
                         overwrite=overwrite,
                     ):
