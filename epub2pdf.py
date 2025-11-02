@@ -419,10 +419,8 @@ def analyze_epub(epub_path: Path) -> EpubAnalysis:
             except ValueError:
                 continue
             parser = SingleImageHTMLParser()
-            try:
-                parser.feed(raw.decode("utf-8"))
-            except UnicodeDecodeError:
-                parser.feed(raw.decode("utf-8", errors="ignore"))
+            content = raw.decode("utf-8", errors="replace")
+            parser.feed(content)
             parser.close()
 
             page_info = PageInfo(
@@ -542,10 +540,8 @@ def convert_images_to_pdf(
                     data = image_stream.read()
             except ValueError as exc:
                 raise ValueError(f"Missing image asset: {page.image_path}") from exc
-            verify_stream = io.BytesIO(data)
             try:
-                with Image.open(verify_stream) as image:
-                    image.verify()
+                with Image.open(io.BytesIO(data)) as image:
                     if first_image_size is None:
                         first_image_size = image.size
             except (UnidentifiedImageError, OSError) as exc:
@@ -1042,6 +1038,13 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
         description="Batch convert EPUB files to A4 PDFs optimized for Sony DPT-RP1."
     )
     parser.add_argument(
+        "-v",
+        "--verbose",
+        action="count",
+        default=0,
+        help="Increase logging verbosity (-v for INFO, -vv for DEBUG).",
+    )
+    parser.add_argument(
         "src",
         type=Path,
         nargs="?",
@@ -1160,9 +1163,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     Returns:
         Process exit code where ``0`` indicates success.
     """
-    if not logging.getLogger().hasHandlers():
-        logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv or sys.argv[1:])
+
+    if args.verbose == 0:
+        level = logging.WARNING
+    elif args.verbose == 1:
+        level = logging.INFO
+    else:
+        level = logging.DEBUG
+
+    root_logger = logging.getLogger()
+    if root_logger.hasHandlers():
+        root_logger.setLevel(level)
+    else:
+        logging.basicConfig(level=level, format="%(levelname)s: %(message)s")
 
     src_path = args.src.resolve(strict=False)
     dst_path = args.dst.resolve(strict=False) if args.dst else None
@@ -1179,6 +1193,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args.margin_left,
         args.margin_right,
     )
+
+    if any(margin < 0 for margin in margins):
+        raise ValueError("Margins must be non-negative")
 
     default_output_dir = (Path.cwd() / "pdf_output").resolve(strict=False)
 
