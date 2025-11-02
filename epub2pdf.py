@@ -15,7 +15,7 @@ from html.parser import HTMLParser
 from pathlib import Path
 
 import img2pdf
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 Margins = tuple[int, int, int, int]
 DEFAULT_BASE_FONT_SIZE = 14
@@ -23,6 +23,11 @@ DEFAULT_MARGIN_POINTS = 4
 MAX_INSPECTION_PAGES = 5
 
 logger = logging.getLogger(__name__)
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover - optional dependency
+    tqdm = None
 
 
 def extract_namespace(tag: str) -> dict[str, str]:
@@ -343,9 +348,19 @@ def convert_images_to_pdf(
                     data = image_stream.read()
             except ValueError as exc:
                 raise ValueError(f"Missing image asset: {page.image_path}") from exc
+            verify_stream = io.BytesIO(data)
+            try:
+                with Image.open(verify_stream) as image:
+                    image.verify()
+            except (UnidentifiedImageError, OSError) as exc:
+                logger.warning("Skipping invalid image %s: %s", page.image_path, exc)
+                continue
             buffer = io.BytesIO(data)
             buffer.name = posixpath.basename(page.image_path) or f"page-{index:03}.jpg"
             buffers.append(buffer)
+
+    if not buffers:
+        raise ValueError("No valid images available for image-only conversion")
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     logger.info(
@@ -547,88 +562,108 @@ def batch_convert(
     converter: str | None = None
     page_size = resolve_page_size(paper_size, custom_size)
 
-    for epub_path, out_path in jobs:
-        analysis: EpubAnalysis | None = None
-        use_image_pipeline = False
+    total_jobs = len(jobs)
+    progress = None
+    job_iterable = jobs
+    if tqdm and total_jobs > 1:
+        progress = tqdm(jobs, total=total_jobs, desc="Converting", unit="book")
+        job_iterable = progress
 
-        if force_full_image or image_only or inspect_epub:
-            try:
-                analysis = analyze_epub(epub_path)
-            except Exception as exc:
-                logger.warning("Failed to inspect %s: %s", epub_path.name, exc)
+    try:
+        for index, (epub_path, out_path) in enumerate(job_iterable, 1):
+            if progress:
+                progress.set_postfix(file=epub_path.name, refresh=False)
+            else:
+                logger.info("Processing %s/%s: %s", index, total_jobs, epub_path.name)
 
-        if analysis and inspect_epub:
-            print_epub_inspection(epub_path, analysis)
+            analysis: EpubAnalysis | None = None
+            use_image_pipeline = False
 
-        if analysis:
-            if image_only:
-                if analysis.is_image_book and analysis.image_pages:
-                    use_image_pipeline = True
-                else:
-                    logger.warning(
-                        "%s does not appear to be single-image; falling back to Calibre pipeline.",
+            if force_full_image or image_only or inspect_epub:
+                try:
+                    analysis = analyze_epub(epub_path)
+                except Exception as exc:
+                    logger.warning("Failed to inspect %s: %s", epub_path.name, exc)
+
+            if analysis and inspect_epub:
+                print_epub_inspection(epub_path, analysis)
+
+            if analysis:
+                if image_only:
+                    if analysis.is_image_book and analysis.image_pages:
+                        use_image_pipeline = True
+                    else:
+                        logger.warning(
+                            "%s does not appear to be single-image; falling back to Calibre pipeline.",
+                            epub_path.name,
+                        )
+                elif (
+                    force_full_image and analysis.is_image_book and analysis.image_pages
+                ):
+                    logger.info(
+                        "Switching to image-only pipeline for %s (fixed-layout detected).",
                         epub_path.name,
                     )
-            elif force_full_image and analysis.is_image_book and analysis.image_pages:
-                logger.info(
-                    "Switching to image-only pipeline for %s (fixed-layout detected).",
+                    use_image_pipeline = True
+            elif image_only:
+                logger.warning(
+                    "Unable to analyze %s; falling back to Calibre pipeline.",
                     epub_path.name,
                 )
-                use_image_pipeline = True
-        elif image_only:
-            logger.warning(
-                "Unable to analyze %s; falling back to Calibre pipeline.",
-                epub_path.name,
-            )
 
-        if use_image_pipeline and analysis:
+            if use_image_pipeline and analysis:
+                try:
+                    if convert_images_to_pdf(
+                        epub_path=epub_path,
+                        out_path=out_path,
+                        image_pages=analysis.image_pages,
+                        page_size=page_size,
+                        margins=margins,
+                        overwrite=overwrite,
+                    ):
+                        converted += 1
+                    else:
+                        skipped += 1
+                except Exception as exc:
+                    failed += 1
+                    logger.error(
+                        "Image-only conversion failed for %s: %s", epub_path, exc
+                    )
+                continue
+
+            if converter is None:
+                try:
+                    converter = find_ebook_convert()
+                except RuntimeError as exc:
+                    logger.error("%s", exc)
+                    failed += 1
+                    continue
+
             try:
-                if convert_images_to_pdf(
+                if convert_epub_to_pdf(
+                    converter=converter,
                     epub_path=epub_path,
                     out_path=out_path,
-                    image_pages=analysis.image_pages,
-                    page_size=page_size,
-                    margins=margins,
+                    serif_font=serif_font,
+                    sans_font=sans_font,
+                    base_font_size=base_font_size,
                     overwrite=overwrite,
+                    paper_size=paper_size,
+                    custom_size=custom_size,
+                    margins=margins,
+                    disable_font_rescaling=disable_font_rescaling,
+                    no_text=no_text,
+                    force_full_image=force_full_image,
                 ):
                     converted += 1
                 else:
                     skipped += 1
-            except Exception as exc:
+            except subprocess.CalledProcessError as error:
                 failed += 1
-                logger.error("Image-only conversion failed for %s: %s", epub_path, exc)
-            continue
-
-        if converter is None:
-            try:
-                converter = find_ebook_convert()
-            except RuntimeError as exc:
-                logger.error("%s", exc)
-                failed += 1
-                continue
-
-        try:
-            if convert_epub_to_pdf(
-                converter=converter,
-                epub_path=epub_path,
-                out_path=out_path,
-                serif_font=serif_font,
-                sans_font=sans_font,
-                base_font_size=base_font_size,
-                overwrite=overwrite,
-                paper_size=paper_size,
-                custom_size=custom_size,
-                margins=margins,
-                disable_font_rescaling=disable_font_rescaling,
-                no_text=no_text,
-                force_full_image=force_full_image,
-            ):
-                converted += 1
-            else:
-                skipped += 1
-        except subprocess.CalledProcessError as error:
-            failed += 1
-            logger.error("Conversion failed for %s: %s", epub_path, error)
+                logger.error("Conversion failed for %s: %s", epub_path, error)
+    finally:
+        if progress:
+            progress.close()
     return converted, skipped, failed
 
 
