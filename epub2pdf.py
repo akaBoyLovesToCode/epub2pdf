@@ -267,9 +267,8 @@ def print_epub_inspection(
         for page in sample:
             width = height = None
             try:
-                with zf.open(page.image_path) as image_stream:
-                    with Image.open(image_stream) as image:
-                        width, height = image.size
+                with zf.open(page.image_path) as image_stream, Image.open(image_stream) as image:
+                    width, height = image.size
             except Exception as exc:
                 print(f"  {page.html_path} -> {page.image_path} [error: {exc}]")
                 continue
