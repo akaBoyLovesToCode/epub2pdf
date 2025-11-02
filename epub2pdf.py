@@ -5,12 +5,12 @@ import posixpath
 import shutil
 import subprocess
 import sys
+import xml.etree.ElementTree as ET
 import zipfile
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Iterable, Sequence
-import xml.etree.ElementTree as ET
 
 import img2pdf
 from PIL import Image
