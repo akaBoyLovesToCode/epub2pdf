@@ -17,9 +17,13 @@ from pathlib import Path
 import img2pdf
 from PIL import Image, UnidentifiedImageError
 
+# Page margin tuple order: (top, bottom, left, right) expressed in points.
 Margins = tuple[int, int, int, int]
+# Fallback Calibre base font size (points) when callers do not override it.
 DEFAULT_BASE_FONT_SIZE = 14
+# Default per-side margin (points) applied unless CLI arguments supply values.
 DEFAULT_MARGIN_POINTS = 4
+# Number of sample pages displayed when inspecting image-centric EPUBs.
 MAX_INSPECTION_PAGES = 5
 
 logger = logging.getLogger(__name__)
@@ -31,7 +35,16 @@ except ImportError:  # pragma: no cover - optional dependency
 
 
 def extract_namespace(tag: str) -> dict[str, str]:
-    """Return namespace mapping for an XML tag such as '{uri}package'."""
+    """Derive an OPF namespace mapping from a tag string.
+
+    Args:
+        tag: An XML tag that may include a namespace, e.g. ``"{uri}package"``.
+
+    Returns:
+        A mapping suitable for ``ElementTree`` lookups where the ``"opf"`` prefix
+        is bound to the parsed namespace URI. Returns an empty mapping when the
+        tag does not include a namespace.
+    """
     if tag.startswith("{"):
         uri = tag[1:].split("}", 1)[0]
         return {"opf": uri}
@@ -40,7 +53,18 @@ def extract_namespace(tag: str) -> dict[str, str]:
 
 @contextmanager
 def open_epub_file(zf: zipfile.ZipFile, path: str):
-    """Yield a file-like object from the EPUB archive with consistent errors."""
+    """Yield a binary stream from an EPUB archive entry.
+
+    Args:
+        zf: An open ``zipfile.ZipFile`` pointing at the EPUB archive.
+        path: The internal path to open.
+
+    Yields:
+        A readable binary stream for the requested member.
+
+    Raises:
+        ValueError: If ``path`` is not present in the archive.
+    """
     try:
         with zf.open(path) as stream:
             yield stream
@@ -49,7 +73,11 @@ def open_epub_file(zf: zipfile.ZipFile, path: str):
 
 
 def get_full_image_css() -> str:
-    """Return CSS that forces images to fill the page for fixed-layout content."""
+    """Generate CSS used to coerce fixed-layout images to full-bleed pages.
+
+    Returns:
+        A CSS string passed to Calibre's ``--extra-css`` flag.
+    """
     return (
         "img, image, svg, figure { "
         "width: 100% !important; "
@@ -65,6 +93,8 @@ def get_full_image_css() -> str:
 
 @dataclass
 class PageInfo:
+    """Metadata extracted from one HTML spine document."""
+
     html_path: str
     image_sources: list[str]
     has_viewport: bool
@@ -72,6 +102,8 @@ class PageInfo:
 
 @dataclass
 class ImagePage:
+    """Represents a single-image HTML page with its resolved asset path."""
+
     html_path: str
     image_path: str
     has_viewport: bool
@@ -79,6 +111,8 @@ class ImagePage:
 
 @dataclass
 class EpubAnalysis:
+    """Summary of image usage, viewport hints, and layout traits found in an EPUB."""
+
     pages: list[PageInfo]
     image_pages: list[ImagePage]
     is_image_book: bool
@@ -86,6 +120,8 @@ class EpubAnalysis:
 
 
 class SingleImageHTMLParser(HTMLParser):
+    """Collects image sources and viewport meta tags from XHTML content."""
+
     def __init__(self) -> None:
         super().__init__()
         self.image_sources: list[str] = []
@@ -103,7 +139,17 @@ class SingleImageHTMLParser(HTMLParser):
 
 
 def find_ebook_convert() -> str:
-    """Locate Calibre's ebook-convert executable across supported platforms."""
+    """Locate Calibre's ``ebook-convert`` executable.
+
+    Searches environment variables, PATH, and known installation directories for
+    Windows, macOS, and Linux.
+
+    Returns:
+        The absolute filesystem path to ``ebook-convert``.
+
+    Raises:
+        RuntimeError: If the executable cannot be found.
+    """
     candidates: list[str] = []
 
     env_path = os.environ.get("EBOOK_CONVERT") or os.environ.get(
@@ -157,6 +203,7 @@ def find_ebook_convert() -> str:
     )
 
 
+# Supported paper sizes mapped to their width/height in millimetres.
 PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
     "a4": (210.0, 297.0),
     "a5": (148.0, 210.0),
@@ -167,6 +214,19 @@ PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
 
 
 def parse_custom_size(custom_size: str | None) -> tuple[float, float] | None:
+    """Parse a custom page size specification.
+
+    Args:
+        custom_size: String such as ``"210x297mm"`` describing width and height.
+
+    Returns:
+        A tuple of ``(width_mm, height_mm)`` when input is provided, or ``None``
+        when ``custom_size`` is empty.
+
+    Raises:
+        ValueError: If the format is invalid, contains non-numeric components,
+        or contains non-positive values.
+    """
     if not custom_size:
         return None
     normalized = custom_size.lower().replace("mm", "")
@@ -188,6 +248,18 @@ def parse_custom_size(custom_size: str | None) -> tuple[float, float] | None:
 
 
 def resolve_page_size(paper_size: str, custom_size: str | None) -> tuple[float, float]:
+    """Determine the target PDF page size in points.
+
+    Args:
+        paper_size: Named paper size (e.g., ``"a4"``) used when ``custom_size`` is absent.
+        custom_size: Optional custom dimensions string parsed by :func:`parse_custom_size`.
+
+    Returns:
+        A tuple of ``(width_pt, height_pt)`` compatible with img2pdf.
+
+    Raises:
+        ValueError: If the specified paper size is unknown or dimensions are non-positive.
+    """
     custom_mm = parse_custom_size(custom_size)
     if custom_mm:
         return (img2pdf.mm_to_pt(custom_mm[0]), img2pdf.mm_to_pt(custom_mm[1]))
@@ -204,11 +276,32 @@ def resolve_page_size(paper_size: str, custom_size: str | None) -> tuple[float, 
 
 
 def resolve_zip_href(base_path: str, href: str) -> str:
+    """Resolve a relative asset reference within the EPUB zip.
+
+    Args:
+        base_path: The directory of the referencing document inside the archive.
+        href: The raw hyperlink or relative path.
+
+    Returns:
+        A normalized path safe for ``zipfile`` lookups.
+    """
     normalized = posixpath.normpath(posixpath.join(posixpath.dirname(base_path), href))
     return normalized
 
 
 def get_spine_document_paths(zf: zipfile.ZipFile) -> list[str]:
+    """Extract the ordered spine document paths from the EPUB package.
+
+    Args:
+        zf: Open ``zipfile.ZipFile`` for the EPUB.
+
+    Returns:
+        A list of document paths in spine order. Falls back to sorted XHTML/HTML
+        files if the spine is empty.
+
+    Raises:
+        ValueError: When required container or package metadata is missing.
+    """
     try:
         with open_epub_file(zf, "META-INF/container.xml") as container_file:
             container_xml = container_file.read()
@@ -266,6 +359,17 @@ def get_spine_document_paths(zf: zipfile.ZipFile) -> list[str]:
 
 
 def analyze_epub(epub_path: Path) -> EpubAnalysis:
+    """Inspect an EPUB to detect single-image pages and viewport metadata.
+
+    Args:
+        epub_path: Filesystem path to the EPUB archive.
+
+    Returns:
+        :class:`EpubAnalysis` describing image usage and viewport hints.
+
+    Raises:
+        ValueError: Propagated when required EPUB components are missing.
+    """
     with zipfile.ZipFile(epub_path, "r") as zf:
         spine_documents = get_spine_document_paths(zf)
         pages: list[PageInfo] = []
@@ -316,6 +420,13 @@ def analyze_epub(epub_path: Path) -> EpubAnalysis:
 def print_epub_inspection(
     epub_path: Path, analysis: EpubAnalysis, limit: int = MAX_INSPECTION_PAGES
 ) -> None:
+    """Log a summary of representative image pages from an EPUB.
+
+    Args:
+        epub_path: Path to the EPUB archive being inspected.
+        analysis: Output from :func:`analyze_epub`.
+        limit: Maximum number of image pages to show in the log output.
+    """
     logger.info("Inspecting %s", epub_path)
     if not analysis.image_pages:
         logger.info("No single-image pages detected.")
@@ -357,6 +468,22 @@ def convert_images_to_pdf(
     margins: Margins,
     overwrite: bool,
 ) -> bool:
+    """Render single-image pages directly to a PDF.
+
+    Args:
+        epub_path: Source EPUB archive.
+        out_path: Destination PDF file.
+        image_pages: Pages identified as image-only content.
+        page_size: Output page size in points.
+        margins: Margins tuple used for img2pdf borders.
+        overwrite: Whether to replace an existing file.
+
+    Returns:
+        ``True`` when a file is written, ``False`` when skipped due to existence.
+
+    Raises:
+        ValueError: If required assets are missing or all images are invalid.
+    """
     if out_path.exists():
         if not overwrite:
             logger.info("Skipping existing file %s", out_path)
@@ -424,6 +551,25 @@ def build_command(
     no_text: bool,
     force_full_image: bool,
 ) -> list[str]:
+    """Assemble the argument list for a Calibre ``ebook-convert`` invocation.
+
+    Args:
+        converter: Path to ``ebook-convert``.
+        epub_path: Source EPUB archive.
+        out_path: Destination PDF path.
+        serif_font: Serif font family name for PDF embedding.
+        sans_font: Sans-serif font family name.
+        base_font_size: Base font size (points).
+        paper_size: Named paper size string.
+        custom_size: Optional custom size string for Calibre.
+        margins: Tuple of page margins (points).
+        disable_font_rescaling: Whether to disable Calibre font rescaling.
+        no_text: Whether to pass ``--no-text`` to Calibre.
+        force_full_image: Whether to add CSS forcing full-bleed images.
+
+    Returns:
+        A list of command-line arguments.
+    """
     top, bottom, left, right = margins
     command = [
         converter,
@@ -469,6 +615,14 @@ def build_command(
 
 
 def format_command(parts: Iterable[str]) -> str:
+    """Render a shell-safe representation of a command sequence.
+
+    Args:
+        parts: Iterable of command tokens.
+
+    Returns:
+        A shell-escaped string suitable for logging.
+    """
     try:
         from shlex import quote
     except ImportError:
@@ -477,6 +631,16 @@ def format_command(parts: Iterable[str]) -> str:
 
 
 def run_calibre_command(cmd: list[str], allow_no_text: bool) -> None:
+    """Invoke Calibre and retry with compatible flags when necessary.
+
+    Args:
+        cmd: List of command-line arguments for ``ebook-convert``.
+        allow_no_text: Whether we may drop ``--no-text`` if Calibre rejects it.
+
+    Raises:
+        subprocess.CalledProcessError: Re-raised when Calibre exits with a failure
+        status after retries.
+    """
     result = subprocess.run(
         cmd,
         check=False,
@@ -539,6 +703,26 @@ def convert_epub_to_pdf(
     no_text: bool,
     force_full_image: bool,
 ) -> bool:
+    """Run the Calibre pipeline to generate a PDF from an EPUB.
+
+    Args:
+        converter: Path to ``ebook-convert``.
+        epub_path: Source EPUB archive.
+        out_path: Destination PDF path.
+        serif_font: Serif font family for PDF output.
+        sans_font: Sans-serif font family.
+        base_font_size: Base font size (points).
+        overwrite: Whether to replace an existing file.
+        paper_size: Named paper size string.
+        custom_size: Optional Calibre custom size.
+        margins: Margins tuple (points).
+        disable_font_rescaling: Disables Calibre font rescaling if ``True``.
+        no_text: Passes ``--no-text`` to Calibre if ``True``.
+        force_full_image: Adds CSS to force images fullscreen.
+
+    Returns:
+        ``True`` when the conversion produced a PDF, ``False`` when skipped.
+    """
     if out_path.exists():
         if not overwrite:
             logger.info("Skipping existing file %s", out_path)
@@ -581,6 +765,26 @@ def batch_convert(
     image_only: bool,
     inspect_epub: bool,
 ) -> tuple[int, int, int]:
+    """Convert a collection of EPUB files using the appropriate pipeline.
+
+    Args:
+        jobs: Iterable of ``(epub_path, out_path)`` pairs.
+        serif_font: Serif font family for Calibre conversions.
+        sans_font: Sans-serif font family.
+        base_font_size: Base font size (points).
+        overwrite: Whether to replace existing PDFs.
+        paper_size: Named paper size.
+        custom_size: Optional Calibre custom size.
+        margins: Margins tuple (points).
+        disable_font_rescaling: Disables Calibre font rescaling.
+        no_text: Uses ``--no-text`` flag when available.
+        force_full_image: Forces full-image CSS for Calibre conversions.
+        image_only: Prefer the image-only pipeline when possible.
+        inspect_epub: Whether to log inspection details.
+
+    Returns:
+        Tuple of ``(converted, skipped, failed)`` counts.
+    """
     if not jobs:
         logger.info("No EPUB files found for conversion.")
         return (0, 0, 0)
@@ -703,6 +907,17 @@ def resolve_output_path_for_file(
     output: Path | None,
     default_dir: Path,
 ) -> Path:
+    """Derive the destination PDF path for a given source EPUB.
+
+    Args:
+        src_file: Source EPUB file.
+        dst: Optional destination directory supplied via positional argument.
+        output: Optional override provided via ``--output``.
+        default_dir: Fallback directory when neither ``dst`` nor ``output`` is set.
+
+    Returns:
+        Absolute path to the target PDF.
+    """
     candidate = output or dst
     if candidate:
         candidate = candidate.resolve(strict=False)
@@ -718,6 +933,20 @@ def prepare_jobs(
     output: Path | None,
     default_dir: Path,
 ) -> list[tuple[Path, Path]]:
+    """Create conversion jobs based on the provided source path.
+
+    Args:
+        src: Source EPUB file or directory.
+        dst: Optional destination directory argument.
+        output: Optional ``--output`` override.
+        default_dir: Fallback directory used when no destination is specified.
+
+    Returns:
+        A list of ``(epub_path, pdf_path)`` tuples ready for processing.
+
+    Raises:
+        ValueError: If the source path is invalid or incompatible with the destination.
+    """
     if not src.exists():
         raise ValueError(f"Source path not found: {src}")
     if src.is_file():
@@ -743,6 +972,14 @@ def prepare_jobs(
 
 
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
+    """Parse command-line arguments for the CLI entry point.
+
+    Args:
+        argv: Raw argument list, typically ``sys.argv[1:]``.
+
+    Returns:
+        Parsed ``argparse.Namespace`` containing CLI options.
+    """
     parser = argparse.ArgumentParser(
         description="Batch convert EPUB files to A4 PDFs optimized for Sony DPT-RP1."
     )
@@ -857,6 +1094,14 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    """Coordinate argument parsing and execute the conversion workflow.
+
+    Args:
+        argv: Optional argument list, defaults to ``sys.argv[1:]``.
+
+    Returns:
+        Process exit code where ``0`` indicates success.
+    """
     if not logging.getLogger().hasHandlers():
         logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
     args = parse_args(argv or sys.argv[1:])
