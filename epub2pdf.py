@@ -48,6 +48,21 @@ def open_epub_file(zf: zipfile.ZipFile, path: str):
         raise ValueError(f"File not found in EPUB: {path}") from exc
 
 
+def get_full_image_css() -> str:
+    """Return CSS that forces images to fill the page for fixed-layout content."""
+    return (
+        "img, image, svg, figure { "
+        "width: 100% !important; "
+        "height: auto !important; "
+        "display: block !important; "
+        "} "
+        "body { "
+        "margin: 0 !important; "
+        "padding: 0 !important; "
+        "}"
+    )
+
+
 @dataclass
 class PageInfo:
     html_path: str
@@ -154,14 +169,21 @@ PAPER_SIZES_MM: dict[str, tuple[float, float]] = {
 def parse_custom_size(custom_size: str | None) -> tuple[float, float] | None:
     if not custom_size:
         return None
-    parts = custom_size.lower().replace("mm", "").split("x")
+    normalized = custom_size.lower().replace("mm", "")
+    parts = [part.strip() for part in normalized.split("x") if part.strip()]
     if len(parts) != 2:
-        return None
+        raise ValueError(
+            f"Invalid custom size '{custom_size}'. Expected format '<width>x<height>mm'."
+        )
     try:
         width = float(parts[0])
         height = float(parts[1])
-    except ValueError:
-        return None
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid numeric values in custom size '{custom_size}'."
+        ) from exc
+    if width <= 0 or height <= 0:
+        raise ValueError("Custom page size values must be greater than zero.")
     return width, height
 
 
@@ -169,7 +191,15 @@ def resolve_page_size(paper_size: str, custom_size: str | None) -> tuple[float, 
     custom_mm = parse_custom_size(custom_size)
     if custom_mm:
         return (img2pdf.mm_to_pt(custom_mm[0]), img2pdf.mm_to_pt(custom_mm[1]))
-    mm_values = PAPER_SIZES_MM.get(paper_size.lower(), PAPER_SIZES_MM["a4"])
+    normalized = paper_size.lower()
+    if normalized not in PAPER_SIZES_MM:
+        valid = ", ".join(sorted(PAPER_SIZES_MM))
+        raise ValueError(
+            f"Unsupported paper size '{paper_size}'. Valid options: {valid}."
+        )
+    mm_values = PAPER_SIZES_MM[normalized]
+    if mm_values[0] <= 0 or mm_values[1] <= 0:
+        raise ValueError(f"Paper size '{paper_size}' must have positive dimensions.")
     return (img2pdf.mm_to_pt(mm_values[0]), img2pdf.mm_to_pt(mm_values[1]))
 
 
@@ -430,7 +460,7 @@ def build_command(
         command.extend(
             [
                 "--extra-css",
-                "img, image, svg, figure { width: 100% !important; height: auto !important; } body { margin: 0 !important; padding: 0 !important; }",
+                get_full_image_css(),
                 "--filter-css",
                 "width,height,max-width,max-height",
             ]
