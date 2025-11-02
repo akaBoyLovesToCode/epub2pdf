@@ -53,6 +53,10 @@ uv run epub2pdf "epub_files/book.epub" \
 uv run epub2pdf epub_files --inspect-epub
 ```
 
+## Development
+
+Ruff manages linting and formatting, and its configuration in `pyproject.toml` mirrors the Zed editor settings: line length 88, Python target version 3.12, lint rules `E`, `W`, `F`, `UP`, `B`, `C4`, `I`, `N`, `SIM` with `E501` ignored, a per-file ignore of `F401` for `__init__.py`, and formatter preferences for double quotes, spaces, and keeping magic trailing commas. Run `uv run ruff check .` and `uv run ruff format .` before opening a pull request.
+
 ## License
 
 This project is licensed under the MIT License.
